@@ -11,7 +11,10 @@ import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okio.IOException
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
 import org.json.JSONObject
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
@@ -32,7 +35,6 @@ import org.signal.libsignal.protocol.ecc.ECPrivateKey
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 
-// 新增 Signal Protocol 相关的导入
 import org.signal.libsignal.protocol.SessionBuilder
 import org.signal.libsignal.protocol.SessionCipher
 import org.signal.libsignal.protocol.InvalidKeyException
@@ -41,26 +43,33 @@ import org.signal.libsignal.protocol.DuplicateMessageException
 import org.signal.libsignal.protocol.NoSessionException
 import org.signal.libsignal.protocol.UntrustedIdentityException
 import org.signal.libsignal.protocol.message.CiphertextMessage
+import org.signal.libsignal.protocol.message.PreKeySignalMessage // 导入 PreKeySignalMessage
+import org.signal.libsignal.protocol.message.SignalMessage // 导入 SignalMessage
+// 如果你也需要处理明文消息或 SenderKey 消息，可能还需要：
+import org.signal.libsignal.protocol.message.PlaintextContent
+import org.signal.libsignal.protocol.message.SenderKeyMessage
 import org.signal.libsignal.protocol.state.PreKeyBundle
-import org.signal.libsignal.protocol.ecc.ECPublicKey // 导入 ECPublicKey
-import org.signal.libsignal.protocol.state.impl.InMemorySessionStore // 导入 InMemorySessionStore
-import org.signal.libsignal.protocol.state.impl.InMemoryKyberPreKeyStore // 导入 InMemoryKyberPreKeyStore
+import org.signal.libsignal.protocol.ecc.ECPublicKey
+import org.signal.libsignal.protocol.state.impl.InMemorySessionStore
+import org.signal.libsignal.protocol.state.impl.InMemoryKyberPreKeyStore
 
-import java.security.MessageDigest // **新增导入**
-import java.util.Arrays // **新增导入**
+import java.security.MessageDigest
+import java.util.Arrays
 
-class MainActivity3 : AppCompatActivity() {
+class MainActivity3 : AppCompatActivity(), WebSocketListenerCallback { // 实现 WebSocketListenerCallback
 
     private val TAG = "SignalChatApp"
     private val SERVER_BASE_URL = "http://192.168.1.196:5000" // 确保这是你的服务器 IP
+    // WebSocket URL, 注意是 ws:// 或 wss://
+    private val WEBSOCKET_URL = "ws://192.168.1.196:8766/ws"
 
     private lateinit var etUserId: EditText
     private lateinit var btnRegister: Button
     private lateinit var etRecipientId: EditText
     private lateinit var btnFetchKeys: Button
-    // 新增：发送消息 UI
     private lateinit var etMessage: EditText
     private lateinit var btnSendMessage: Button
+    private lateinit var etReceivedMessages: EditText // 新增：显示接收到的消息
 
     private lateinit var identityKeyPair: IdentityKeyPair
     private var registrationId: Int = 0
@@ -73,9 +82,12 @@ class MainActivity3 : AppCompatActivity() {
 
     private lateinit var apiService: ApiService
 
-    // 新增：用于存储已建立会话的 SessionCipher
-    // Key: 接收方 userId, Value: SessionCipher
     private val sessionCiphers: MutableMap<String, SessionCipher> = mutableMapOf()
+
+    // WebSocket 客户端相关
+    private val okHttpClient = OkHttpClient()
+    private var webSocket: WebSocket? = null
+    private lateinit var chatWebSocketListener: ChatWebSocketListener
 
     @RequiresApi(Build.VERSION_CODES.O)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -88,6 +100,7 @@ class MainActivity3 : AppCompatActivity() {
         btnFetchKeys = findViewById(R.id.btnFetchKeys)
         etMessage = findViewById(R.id.etMessage)
         btnSendMessage = findViewById(R.id.btnSendMessage)
+        etReceivedMessages = findViewById(R.id.etReceivedMessages) // 初始化
 
         val ecKeyPair = Curve.generateKeyPair()
         identityKeyPair = IdentityKeyPair(
@@ -103,6 +116,9 @@ class MainActivity3 : AppCompatActivity() {
             .addConverterFactory(GsonConverterFactory.create())
             .build()
         apiService = retrofit.create(ApiService::class.java)
+
+        // 初始化 WebSocket 监听器
+        chatWebSocketListener = ChatWebSocketListener(this)
 
         btnRegister.setOnClickListener {
             val userId = etUserId.text.toString().trim()
@@ -135,6 +151,68 @@ class MainActivity3 : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        webSocket?.close(1000, "App closing") // 关闭 WebSocket 连接
+    }
+
+    // --- WebSocketListenerCallback 的实现 ---
+    override fun onWebSocketConnected() {
+        runOnUiThread {
+            Toast.makeText(this, "WebSocket connected!", Toast.LENGTH_SHORT).show()
+            // 可以在连接成功后发送一个认证消息，让服务器知道当前连接的用户是谁
+            val userId = etUserId.text.toString().trim()
+            if (userId.isNotEmpty()) {
+                val authMessage = JSONObject().apply {
+                    put("type", "auth")
+                    put("userId", userId)
+                }.toString()
+                webSocket?.send(authMessage)
+                Log.d(TAG, "Sent WebSocket auth message for userId: $userId")
+            }
+        }
+    }
+    // 处理认证成功消息
+    override fun onWebSocketAuthenticated(userId: String) {
+        runOnUiThread {
+            Log.d(TAG, "User $userId authenticated successfully via WebSocket.")
+            Toast.makeText(this, "Authenticated as $userId!", Toast.LENGTH_SHORT).show()
+            // 可以在这里更新UI，例如显示“在线”状态，或者启用消息发送按钮
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    // *** 关键修改在这里：改变方法签名以接收独立参数 ***
+    override fun onWebSocketMessage(senderId: String, messageType: Int, encryptedMessageData: String) {
+        runOnUiThread {
+            Log.d(TAG, "Received structured message from $senderId, type: $messageType")
+            // 现在你直接拿到了所有需要的信息
+            // 在这里直接调用你的解密和显示消息的方法
+            // 例如：
+            receiveAndDecryptMessage(senderId, encryptedMessageData, messageType)
+        }
+    }
+
+    override fun onWebSocketClosing(code: Int, reason: String) {
+        runOnUiThread {
+            Toast.makeText(this, "WebSocket closing: $reason", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onWebSocketClosed(code: Int, reason: String) {
+        runOnUiThread {
+            Toast.makeText(this, "WebSocket closed: $reason", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onWebSocketFailure(t: Throwable, response: Response?) {
+        runOnUiThread {
+            Toast.makeText(this, "WebSocket failure: ${t.message}", Toast.LENGTH_LONG).show()
+            Log.e(TAG, "WebSocket failure: ${t.message}", t)
+        }
+    }
+    // --- WebSocketListenerCallback 的实现结束 ---
+
     @RequiresApi(Build.VERSION_CODES.O)
     private fun registerUser(userId: String) {
         lifecycleScope.launch(Dispatchers.Main) {
@@ -145,6 +223,8 @@ class MainActivity3 : AppCompatActivity() {
             if (success) {
                 Toast.makeText(this@MainActivity3, "User $userId registered successfully!", Toast.LENGTH_LONG).show()
                 Log.d(TAG, "User $userId registration successful.")
+                // 注册成功后尝试连接 WebSocket
+                connectWebSocket(userId)
             } else {
                 Toast.makeText(this@MainActivity3, "Registration failed for $userId. Check logs.", Toast.LENGTH_LONG).show()
                 Log.e(TAG, "User $userId registration failed.")
@@ -152,6 +232,7 @@ class MainActivity3 : AppCompatActivity() {
         }
     }
 
+    // ... (performRegistration, sendRegistrationRequest 保持不变) ...
     @RequiresApi(Build.VERSION_CODES.O)
     private fun performRegistration(userId: String): Boolean {
         return try {
@@ -222,13 +303,14 @@ class MainActivity3 : AppCompatActivity() {
             Log.d(TAG, "Server Response Code: $responseCode")
 
             responseCode == HttpURLConnection.HTTP_OK
-        } catch (e: IOException) {
+        } catch (e: java.io.IOException) { // 明确捕获 IOException
             Log.e(TAG, "Network error during registration: ${e.message}", e)
             false
         } finally {
             connection?.disconnect()
         }
     }
+
 
     @RequiresApi(Build.VERSION_CODES.O)
     private fun fetchRecipientKeys(recipientId: String) {
@@ -327,15 +409,16 @@ class MainActivity3 : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     Toast.makeText(this@MainActivity3, "Session established with $recipientId! Safety Number: $safetyNumber", Toast.LENGTH_LONG).show()
-                    // 你也可以在 UI 上显示这个安全号码，让用户手动比较
                 }
 
-                if (recipientOneTimePreKeyId != null) {
+                if (recipientOneTimePreKeyId != null && recipientOneTimePreKeyId != 0) {
                     Log.d(TAG, "One-Time PreKey with ID ${recipientOneTimePreKeyId} consumed. Need to notify server.")
-                    // TODO: Implement server notification for pre-key consumption
+                    // **重要：通知服务器该 preKey 已被消耗**
+                    // 这需要在服务器端实现一个 endpoint 来接收这种通知，并将该 preKey 标记为已使用或删除
+                    notifyPreKeyConsumed(recipientId, recipientOneTimePreKeyId)
                 }
 
-            } catch (e: Exception) { // 统一捕获 Exception，便于调试
+            } catch (e: Exception) {
                 Log.e(TAG, "Error during session setup: ${e.message}", e)
                 withContext(Dispatchers.Main) { Toast.makeText(this@MainActivity3, "Session setup failed: ${e.message}", Toast.LENGTH_LONG).show() }
             }
@@ -353,8 +436,14 @@ class MainActivity3 : AppCompatActivity() {
                 return@launch
             }
 
+            if (webSocket == null || !webSocket!!.send("")) { // 检查 WebSocket 连接是否就绪
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity3, "WebSocket is not connected. Cannot send message.", Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+
             try {
-                // 加密消息
                 val encryptedMessage = sessionCipher.encrypt(messageText.toByteArray(Charsets.UTF_8))
                 val type = encryptedMessage.type
                 val ciphertext = Base64.getEncoder().encodeToString(encryptedMessage.serialize())
@@ -365,10 +454,8 @@ class MainActivity3 : AppCompatActivity() {
                     Toast.makeText(this@MainActivity3, "Message encrypted!", Toast.LENGTH_SHORT).show()
                 }
 
-                // ⚠️ 下一步：将加密后的消息发送到服务器
-                // 你需要实现一个消息转发机制，服务器接收加密消息，然后推送给接收方
-                // 示例：sendMessageToServer(recipientId, type, ciphertext)
-                Log.d(TAG, "TODO: Send encrypted message to server for $recipientId")
+                // 将加密消息通过 WebSocket 发送
+                sendEncryptedMessageViaWebSocket(recipientId, type, ciphertext)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Error encrypting message: ${e.message}", e)
@@ -428,44 +515,179 @@ class MainActivity3 : AppCompatActivity() {
         return a.size - b.size
     }
 
-    // TODO: 接收消息和解密消息的逻辑
-    // 当你从服务器收到加密消息时，需要用 sessionCipher.decrypt() 进行解密
-    // 例如：
-    /*
+    // --- 新增 WebSocket 相关方法 ---
+
+    private fun connectWebSocket(userId: String) {
+        // 1. 如果已有 WebSocket 连接，先尝试关闭它，确保清理旧状态
+        if (webSocket != null) {
+            Log.d(TAG, "Closing existing WebSocket connection before reconnecting.")
+            webSocket?.close(1000, "Reconnecting") // 优雅地关闭旧连接
+            webSocket = null // 立即将 webSocket 设置为 null
+        }
+
+        // 2. 确保 okHttpClient 被初始化 (虽然你在 onCreate 做了，但重复确保一下无害)
+        // okHttpClient = OkHttpClient() // 如果你确定它总是在 onCreate 中初始化一次，这里可以省略
+
+        val request = Request.Builder().url("$WEBSOCKET_URL?userId=$userId").build()
+        // 3. 每次都创建新的 WebSocket 实例
+        webSocket = okHttpClient.newWebSocket(request, chatWebSocketListener)
+        Log.d(TAG, "Attempting to connect WebSocket to $WEBSOCKET_URL for user $userId")
+    }
+
+    private fun sendEncryptedMessageViaWebSocket(recipientId: String, messageType: Int, ciphertext: String) {
+        val currentUserId = etUserId.text.toString().trim()
+        if (webSocket != null && currentUserId.isNotEmpty()) {
+            val messageJson = JSONObject().apply {
+                put("type", "message") // 消息类型为 "message"
+                put("senderId", currentUserId)
+                put("recipientId", recipientId)
+                put("messageType", messageType) // Signal Protocol 的消息类型 (PREKEY_BUNDLE_TYPE 或 WHISPER_TYPE)
+                put("encryptedMessage", ciphertext)
+            }
+            webSocket?.send(messageJson.toString())
+            Log.d(TAG, "Sent encrypted message via WebSocket to $recipientId")
+            runOnUiThread {
+                etReceivedMessages.append("\nMe to $recipientId: ${etMessage.text.toString()}") // 显示自己发送的消息
+                etMessage.text.clear()
+            }
+        } else {
+            Log.e(TAG, "WebSocket not connected or current user ID is empty. Cannot send message.")
+            runOnUiThread { Toast.makeText(this, "WebSocket not ready. Message not sent.", Toast.LENGTH_SHORT).show() }
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.O)
     private fun receiveAndDecryptMessage(senderId: String, encryptedMessageData: String, messageType: Int) {
         lifecycleScope.launch(Dispatchers.IO) {
-            val sessionCipher = sessionCiphers[senderId]
-            if (sessionCipher == null) {
-                Log.e(TAG, "No session established with $senderId to decrypt message.")
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity3, "No session with $senderId to decrypt message.", Toast.LENGTH_LONG).show()
-                }
-                return@launch
-            }
+            // 获取当前发送方的会话加密器。使用 var 允许在处理过程中更新它。
+            var currentSessionCipher = sessionCiphers[senderId]
 
             try {
-                val ciphertextMessage: CiphertextMessage = when(messageType) {
-                    CiphertextMessage.PREKEY_BUNDLE_TYPE -> PreKeyBundleMessage(Base64.getDecoder().decode(encryptedMessageData))
-                    CiphertextMessage.WHISPER_TYPE -> WhisperMessage(Base64.getDecoder().decode(encryptedMessageData))
-                    else -> throw IllegalArgumentException("Unknown message type: $messageType")
+                // 解码 Base64 编码的消息数据
+                val decodedMessageBytes = Base64.getDecoder().decode(encryptedMessageData)
+
+                // 根据消息类型创建正确的 CiphertextMessage 子类实例
+                val ciphertextMessage: CiphertextMessage = when (messageType) {
+                    // PREKEY_TYPE 对应 PreKeySignalMessage
+                    CiphertextMessage.PREKEY_TYPE -> PreKeySignalMessage(decodedMessageBytes)
+                    // WHISPER_TYPE 对应 SignalMessage
+                    CiphertextMessage.WHISPER_TYPE -> SignalMessage(decodedMessageBytes)
+                    // 如果还需要处理其他类型的消息，例如 PlaintextContent 或 SenderKeyMessage
+                    CiphertextMessage.PLAINTEXT_CONTENT_TYPE -> PlaintextContent(decodedMessageBytes)
+                    CiphertextMessage.SENDERKEY_TYPE -> SenderKeyMessage(decodedMessageBytes)
+                    else -> throw IllegalArgumentException("未知或不支持的消息类型: $messageType")
                 }
 
-                val decryptedBytes = sessionCipher.decrypt(ciphertextMessage)
-                val decryptedMessage = String(decryptedBytes, Charsets.UTF_8)
+                var decryptedBytes: ByteArray? = null
+                var messageToDisplay: String? = null
 
-                Log.d(TAG, "Decrypted message from $senderId: $decryptedMessage")
+                // 核心逻辑：尝试解密消息
+                try {
+                    // 如果还没有为该发送方创建 SessionCipher，或者当前 SessionCipher 为空
+                    if (currentSessionCipher == null) {
+                        val senderAddress = SignalProtocolAddress(senderId, 1) // 假设设备 ID 为 1
+                        currentSessionCipher = SessionCipher(
+                            sessionStore, preKeyStore, signedPreKeyStore, kyberPreKeyStore, identityKeyStore, senderAddress
+                        )
+                        // 存储新的 SessionCipher 以供后续使用
+                        sessionCiphers[senderId] = currentSessionCipher
+                    }
+
+                    // 根据 ciphertextMessage 的具体类型调用 SessionCipher.decrypt()
+                    // 无论是 PreKeySignalMessage 还是 SignalMessage，都直接传入 decrypt 方法。
+                    // Signal 协议库会在 decrypt(PreKeySignalMessage) 内部自动处理会话的建立。
+                    decryptedBytes = when (ciphertextMessage) {
+                        is PreKeySignalMessage -> currentSessionCipher.decrypt(ciphertextMessage)
+                        is SignalMessage -> currentSessionCipher.decrypt(ciphertextMessage)
+                        // PlaintextContent 不需要解密，直接获取 body
+                        is PlaintextContent -> ciphertextMessage.getBody()
+                        // SenderKeyMessage 的解密可能需要更复杂的群组会话管理，这里暂时抛出异常
+                        is SenderKeyMessage -> throw UnsupportedOperationException("SenderKeyMessage 解密需要特殊处理，通常用于群组消息。")
+                        else -> throw IllegalArgumentException("无法解密此类型的消息: ${ciphertextMessage.javaClass.simpleName}")
+                    }
+
+                    messageToDisplay = String(decryptedBytes, Charsets.UTF_8)
+                    Log.d(TAG, "从 $senderId 解密消息: $messageToDisplay")
+
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity3, "收到来自 $senderId 的消息: $messageToDisplay", Toast.LENGTH_LONG).show()
+                        etReceivedMessages.append("\n$senderId: $messageToDisplay")
+                    }
+
+                } catch (e: NoSessionException) {
+                    // 如果 SessionCipher.decrypt() 仍然抛出 NoSessionException，这意味着会话确实没有建立。
+                    // 并且根据 SessionBuilder 的 Javadoc，我们不能直接用 SessionBuilder.process(PreKeySignalMessage)。
+                    // 这种情况通常不应该发生，因为 decrypt(PreKeySignalMessage) 旨在处理会话建立。
+                    // 但如果发生了，说明某种状态异常或消息顺序不对。
+                    Log.e(TAG, "解密消息时没有会话，且未能通过 decrypt 自动建立会话: ${e.message}", e)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity3, "无法解密来自 $senderId 的消息: 会话未建立或异常。", Toast.LENGTH_LONG).show()
+                    }
+                    return@launch
+                }
+
+            } catch (e: DuplicateMessageException) {
+                Log.w(TAG, "收到来自 $senderId 的重复消息。跳过解密。", e)
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity3, "Received from $senderId: $decryptedMessage", Toast.LENGTH_LONG).show()
-                    // 在 UI 上显示消息
+                    Toast.makeText(this@MainActivity3, "收到来自 $senderId 的重复消息。", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: InvalidMessageException) {
+                Log.e(TAG, "来自 $senderId 的无效消息: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity3, "来自 $senderId 的无效消息: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: InvalidKeyException) {
+                Log.e(TAG, "来自 $senderId 消息的无效密钥: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity3, "来自 $senderId 消息的无效密钥: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: UntrustedIdentityException) {
+                Log.e(TAG, "来自 $senderId 消息的不可信身份: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity3, "来自 $senderId 消息的不可信身份: ${e.message}。请验证安全码。", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: UnsupportedOperationException) {
+                Log.e(TAG, "不支持的消息类型解密: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity3, "不支持的消息类型解密: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error decrypting message: ${e.message}", e)
+                Log.e(TAG, "解密来自 $senderId 的消息时发生通用错误: ${e.message}", e)
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity3, "Error decrypting message from $senderId: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity3, "解密来自 $senderId 的消息时发生错误: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
     }
-    */
+
+    // 新增：通知服务器预密钥已被消耗
+    private fun notifyPreKeyConsumed(recipientId: String, preKeyId: Int) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val requestBody = JSONObject().apply {
+                    put("userId", recipientId)
+                    put("preKeyId", preKeyId)
+                }
+                val url = URL("$SERVER_BASE_URL/consume_prekey")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json; utf-8")
+                connection.doOutput = true
+
+                connection.outputStream.use { os: OutputStream ->
+                    val input = requestBody.toString().toByteArray(Charsets.UTF_8)
+                    os.write(input, 0, input.size)
+                }
+
+                val responseCode = connection.responseCode
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    Log.d(TAG, "Successfully notified server that preKey $preKeyId for $recipientId was consumed.")
+                } else {
+                    Log.e(TAG, "Failed to notify server about preKey consumption. Code: $responseCode")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error notifying server about preKey consumption: ${e.message}", e)
+            }
+        }
+    }
 }
